@@ -58,6 +58,12 @@
   // form param named `model`.
   Backbone.emulateJSON = false;
 
+  // Turn on `patchUpdates` to use PATCH requests by default when when updates
+  // to the server, instead of PUT. If true, set the `patch` option to `false`
+  // when saving to use a PUT request instead. If false, set the `patch`
+  // options to `true` to perform a PATCH request as needed.
+  Backbone.patchUpdates = false;
+
   // Backbone.Events
   // -----------------
 
@@ -334,6 +340,8 @@
         if (!model.set(model.parse(resp, xhr), options)) return false;
         if (success) success(model, resp, options);
         model.trigger('sync', model, resp, options);
+        // Set the parsed, validated JSON for PATCH requests
+        model.previousJSON = JSON.stringify(model);
       };
       options.error = Backbone.wrapError(options.error, model, options);
       return this.sync('read', this, options);
@@ -381,6 +389,8 @@
         if (!model.set(serverAttrs, options)) return false;
         if (success) success(model, resp, options);
         model.trigger('sync', model, resp, options);
+        // Set the parsed, validated JSON for PATCH requests
+        model.previousJSON = JSON.stringify(model);
       };
 
       // Finish configuring and sending the Ajax request.
@@ -1319,7 +1329,8 @@
     'create': 'POST',
     'update': 'PUT',
     'delete': 'DELETE',
-    'read':   'GET'
+    'read':   'GET',
+    'patch':  'PATCH'
   };
 
   // Override this function to change the manner in which Backbone persists
@@ -1340,22 +1351,41 @@
   Backbone.sync = function(method, model, options) {
     var type = methodMap[method];
 
+    // Default JSON-request options.
+    var params = {dataType: 'json'};
+
     // Default options, unless specified.
     options || (options = {});
-
-    // Default JSON-request options.
-    var params = {type: type, dataType: 'json'};
 
     // Ensure that we have a URL.
     if (!options.url) {
       params.url = getValue(model, 'url') || urlError();
     }
 
-    // Ensure that we have the appropriate request data.
-    if (!options.data && model && (method == 'create' || method == 'update')) {
-      params.contentType = 'application/json';
-      params.data = JSON.stringify(model);
+    // Switch over to a PATCH request
+    if (method == 'update' && options.patch || (Backbone.patchUpdates && options.patch !== false)) {
+      type = 'PATCH';
     }
+
+    // Ensure that we have the appropriate request data.
+    if (!options.data && model) {
+      // Determine if whether or not to use a PATCH request. The previous
+      // state must exist in order to create the patch. If this does not
+      // exist, use a PUT. Check the options if a PATCH should be used.
+      if (type == 'PATCH' && model.previousJSON) {
+        var previousJSON = JSON.parse(model.previousJSON);
+        params.contentType = 'application/json-patch';
+        params.data = JSON.stringify(constructPatch(previousJSON, model.toJSON()));
+      } else if (method == 'create' || method == 'update') {
+        // Reset the type in case the above condition failed in which
+        // case we need to use a PUT
+        type = methodMap[method];
+        params.contentType = 'application/json';
+        params.data = JSON.stringify(model);
+      }
+    }
+
+    params.type = type;
 
     // For older servers, emulate JSON by encoding the request into an HTML-form.
     if (Backbone.emulateJSON) {
@@ -1366,7 +1396,7 @@
     // For older servers, emulate HTTP by mimicking the HTTP method with `_method`
     // And an `X-HTTP-Method-Override` header.
     if (Backbone.emulateHTTP) {
-      if (type === 'PUT' || type === 'DELETE') {
+      if (type === 'PUT' || type === 'DELETE' || type === 'PATCH') {
         if (Backbone.emulateJSON) params.data._method = type;
         params.type = 'POST';
         params.beforeSend = function(xhr) {
@@ -1457,5 +1487,135 @@
   var urlError = function() {
     throw new Error('A "url" property or function must be specified');
   };
+
+  // Patch helper functions
+  function getParent(paths, path) {
+    return paths[path.substr(0, path.match(/\//g).length)];
+  }
+
+  // Checks if `obj` is an array or object
+  function isContainer(obj) {
+    return _.isArray(obj) || _.isObject(obj);
+  }
+
+  // Checks if the two objects are of the same container type
+  function isSameContainer(obj1, obj2) {
+      return (_.isArray(obj1) && _.isArray(obj2)) || (_.isObject(obj1) && _.isObject(obj2));
+  }
+
+  // Flattens an object to a hash of paths and values.
+  function flattenObject(obj, prefix, paths) {
+    prefix || (prefix = '/');
+    paths || (paths = {});
+
+    // Do not bother logging the root path
+    paths[prefix] = {
+      path: prefix,
+      value: obj
+    };
+
+    prefix !== '/' && (prefix = prefix + '/')
+
+    // Recurse for container types
+    if (_.isArray(obj)) {
+      for (var i = 0, l = obj.length; i < l; i++) {
+        flattenObject(obj[i], prefix + i, paths);
+      }
+    } else if (_.isObject(obj)) {
+      for (var key in obj) {
+        flattenObject(obj[key], prefix + key, paths);
+      }
+    }
+
+    return paths;
+  }
+
+  // Constructs a patch that when applied to `obj2`, it will be equivalent
+  // to `obj1`. The patch format conforms to IETF JSON Patch proposal
+  // http://tools.ietf.org/html/draft-ietf-appsawg-json-patch-01
+  function constructPatch(obj1, obj2) {
+    // Patches are only applicable to two of the same container types.
+    if (!isSameContainer(obj1, obj2)) {
+      throw new Error('Patches can only be derived from objects or arrays');
+    }
+
+    var paths1 = flattenObject(obj1),
+      paths2 = flattenObject(obj2),
+      key1,
+      key2,
+      doc1,
+      doc2,
+      patch = [],
+      add = {},
+      remove = {},
+      replace = {},
+      move = {};
+
+    // Iterate over the first object's paths and compare them to the second
+    // set of paths.
+    for (key1 in paths1) {
+      doc1 = paths1[key1], doc2 = paths2[key1];
+      // If the parent of `doc2` doesn't exist, skip it since neither a
+      // remove or replace can occur.
+      if (!getParent(paths2, key1)) {
+        continue;
+      }
+      // If there is a miss in the second object, the key will be marked for
+      // removal.
+      if (!doc2) {
+        remove[key1] = doc1;
+      // If both members have existing values, make sure they are not the
+      // same container and they are not equal. If they are the same
+      // container type, values will be replaced downstream.
+      } else if (!isSameContainer(doc1.value, doc2.value) && !_.isEqual(doc1.value, doc2.value)) {
+        replace[key1] = doc2;
+      }
+    }
+
+    // Iterate over the second object's paths and compare them to the first
+    // set of paths.
+    for (key2 in paths2) {
+      doc1 = paths1[key2], doc2 = paths2[key2];
+      // Missing in first object, thus we mark it to be added.
+      // If the parent path is not present in the first obj, then this
+      // means the whole array/object is new.
+      if (!doc1 && isSameContainer(getParent(paths1, key2), getParent(paths2, key2))) {
+        add[key2] = doc2;
+      }
+    }
+
+    // Attempt to promote add/remove operations to a move operation.
+    // The first occurence of the same value, we can promote to a move.
+    for (key1 in remove) {
+      doc1 = remove[key1];
+      for (key2 in add) {
+        doc2 = add[key2];
+        if (_.isEqual(doc2.value, doc1.value)) {
+          // Remove them from previous hashes
+          delete remove[key1];
+          delete add[key2];
+          move[key1] = doc2
+          break;
+        }
+      }
+    }
+
+    var key;
+    // Populate the patch
+    for (key in add) {
+      patch.push({add: key, value: add[key].value});
+    }
+    for (key in remove) {
+      patch.push({remove: key});
+    }
+    for (key in replace) {
+      patch.push({replace: key, value: replace[key].value});
+    }
+    for (key in move) {
+      patch.push({move: key, to: move[key].path, value: move[key].value});
+    }
+
+    return patch;
+  }
 
 }).call(this);
